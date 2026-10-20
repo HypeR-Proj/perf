@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "hyper-perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+autotests = false
+
+[[bin]]
+name = "hyper-perf"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+clap.workspace = true
+hyper-os.workspace = true
+hyper-rt.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "hyper")'.dependencies]
+hyper-clap-shared.workspace = true

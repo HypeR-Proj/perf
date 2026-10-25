@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded PMU capture control and portable JSON-lines export.
+//! PMU sampling and bounded static-event capture with Perfetto export.
+mod trace;
 #[cfg(target_os = "hyper")]
 extern crate hyper_clap_shared as _;
 use clap::{Parser, Subcommand};
@@ -14,7 +15,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     name = "perf",
-    about = "PMUv3 cycle sampling (requires a pmu-profiling kernel)"
+    about = "PMU sampling and Perfetto kernel-event timelines"
 )]
 struct Args {
     #[command(subcommand)]
@@ -22,6 +23,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Collect static kernel events (requires kernel-trace, independent of PMU).
+    Trace {
+        #[command(subcommand)]
+        command: trace::Command,
+    },
     /// Start recording; the kernel stops automatically at the time limit.
     Start {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
@@ -160,6 +166,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     hyper_os::require_core_abi()?;
     let inspector = CpuInspector::from_handle(startup.take(hyper_os::startup::CPU_INSPECTOR)?);
     match args.command {
+        Command::Trace { command } => return trace::run(command, &inspector),
         Command::Start { seconds, period } => {
             let id = inspector.profile_start(period, seconds)?;
             println!("perf: capture {id} started, period {period} cycles, limit {seconds}s");
@@ -244,7 +251,7 @@ fn main() -> std::process::ExitCode {
         Err(error) => {
             match error.downcast_ref::<Error>() {
                 Some(Error::Status(Status::NOT_SUPPORTED)) => eprintln!(
-                    "perf: PMUv3 profiling is not supported by this kernel/platform; check pmu-profiling and firmware PMU routes"
+                    "perf: requested profiling is not supported; trace needs kernel-trace, PMU sampling needs pmu-profiling and firmware PMU routes"
                 ),
                 Some(Error::Status(Status::BUSY)) => eprintln!(
                     "perf: another capture is active or stopping; use perf status, stop or dump"

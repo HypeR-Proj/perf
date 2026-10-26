@@ -32,6 +32,9 @@ pub enum Command {
         /// Collector sleep interval. Smaller values reduce overwrite at higher overhead.
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=1000))]
         poll_ms: u64,
+        /// Read rings only after capture stops; short workloads must fit the kernel rings.
+        #[arg(long)]
+        snapshot: bool,
         #[arg(last = true)]
         command: Vec<String>,
     },

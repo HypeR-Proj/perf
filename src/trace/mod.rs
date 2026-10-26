@@ -159,6 +159,7 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
             capture: config,
             export,
             poll_ms,
+            snapshot,
             command,
         } => {
             if !command.is_empty() && export.output == "-" {
@@ -181,7 +182,11 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
                     );
                 }
                 loop {
-                    collect(inspector, &mut capture, &mut cursors, !export.no_names)?;
+                    // Bounded snapshots keep readers off live producer rings;
+                    // export runs only after capture admission has closed.
+                    if !snapshot {
+                        collect(inspector, &mut capture, &mut cursors, !export.no_names)?;
+                    }
                     if capture.limited {
                         break;
                     }
@@ -192,7 +197,9 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
                     }
                     let info = require_generation(inspector, Some(generation))?;
                     if info.running == 0 {
-                        // Stop has joined producers; a final pass now sees stable tails.
+                        // Expiry may have closed admission while a writer still
+                        // owns its ring. Join before the final stable-tail read.
+                        stop(inspector, generation)?;
                         collect(inspector, &mut capture, &mut cursors, !export.no_names)?;
                         break;
                     }

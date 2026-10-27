@@ -20,6 +20,7 @@ bench = false
 clap.workspace = true
 hyper-os.workspace = true
 hyper-rt.workspace = true
+hyper-service.workspace = true
 serde_json.workspace = true
 
 [lints]

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
-use hyper_os::{Error, Status, inspect::CpuInspector};
+use hyper_os::{
+    Error, Status,
+    inspect::{CpuInspector, ScanCursor, TaskInspector, ThreadRole},
+};
 use hyper_perf::{export, model, options};
 pub use options::Command;
 use std::{
@@ -34,11 +37,13 @@ fn writer(options: &options::Export) -> Result<Box<dyn Write>> {
 }
 fn collect(
     inspector: &CpuInspector,
+    tasks: Option<&TaskInspector>,
     capture: &mut model::Capture,
     cursors: &mut [u64],
     names: bool,
 ) -> Result<()> {
-    for (cpu, cursor) in cursors.iter_mut().enumerate() {
+    let mut unnamed = std::collections::BTreeSet::new();
+    'cpus: for (cpu, cursor) in cursors.iter_mut().enumerate() {
         if capture.info.cpu_mask[cpu / 8] & (1 << (cpu % 8)) == 0 {
             continue;
         }
@@ -57,24 +62,82 @@ fn collect(
                 if names {
                     for key in ["thread", "prev", "next", "waker"] {
                         if let Some(id) = record.value(key)
+                            && (id != 0 || matches!(key, "prev" | "next"))
                             && !capture.names.contains_key(&id)
                         {
-                            let name = inspector
-                                .trace_thread_name(capture.info.generation, id)
-                                .map(|name| name.as_str().to_owned())
-                                .unwrap_or_else(|_| format!("thread {id:#x} (name unavailable)"));
-                            capture.names.insert(id, name);
+                            unnamed.insert(id);
                         }
                     }
                 }
                 if !capture.add(cpu, record)? {
-                    return Ok(());
+                    break 'cpus;
                 }
             }
             if batch.count() < 8 {
                 break;
             }
         }
+    }
+    // Drain all rings before metadata lookups. Resolve each new identity once;
+    // process/thread inspection is optional and never scheduler authority.
+    if !unnamed.is_empty() {
+        let mut objects = std::collections::BTreeMap::new();
+        for id in unnamed {
+            if let Ok(details) = inspector.trace_thread_details(capture.info.generation, id) {
+                let koid = details.koid().get();
+                capture.names.insert(id, details.name().to_owned());
+                capture.koids.insert(id, koid);
+                objects.insert(koid, id);
+            } else if !capture.names.contains_key(&id) {
+                let name = inspector
+                    .trace_thread_name(capture.info.generation, id)
+                    .map(|name| name.as_str().to_owned())
+                    .unwrap_or_else(|_| format!("thread {id:#x}"));
+                capture.names.insert(id, name);
+            }
+        }
+        if let Some(tasks) = tasks
+            && !objects.is_empty()
+        {
+            let _ = task_metadata(tasks, capture, &objects);
+        }
+    }
+    Ok(())
+}
+fn task_metadata(
+    inspector: &TaskInspector,
+    capture: &mut model::Capture,
+    objects: &std::collections::BTreeMap<u64, u64>,
+) -> Result<()> {
+    let mut cursor = Some(ScanCursor::START);
+    while let Some(position) = cursor {
+        let page = inspector.scan_threads(position)?;
+        for task in page.entries() {
+            if let Some(&id) = objects.get(&task.koid.get()) {
+                capture.names.insert(id, task.name.as_str().to_owned());
+                if task.role == ThreadRole::Vcpu {
+                    capture.vcpu_threads.insert(id);
+                }
+                capture.tasks.insert(
+                    id,
+                    model::Task {
+                        process: task.process_koid.map(|id| id.get()),
+                        idle: task.role == ThreadRole::Idle,
+                    },
+                );
+            }
+        }
+        cursor = page.next();
+    }
+    let mut cursor = Some(ScanCursor::START);
+    while let Some(position) = cursor {
+        let page = inspector.scan_processes(position)?;
+        for process in page.entries() {
+            capture
+                .processes
+                .insert(process.koid.get(), process.name.as_str().to_owned());
+        }
+        cursor = page.next();
     }
     Ok(())
 }
@@ -86,7 +149,8 @@ fn write(
     capture.sort();
     let mut output = io::BufWriter::new(output);
     match options.format {
-        options::Format::Perfetto => export::perfetto(capture, &mut output)?,
+        options::Format::Perfetto => export::perfetto(capture, &mut output, options.raw_events)?,
+        options::Format::Chrome => export::chrome(capture, &mut output, options.raw_events)?,
         options::Format::Jsonl => export::jsonl(capture, &mut output)?,
     }
     output.flush()?;
@@ -115,7 +179,15 @@ fn require_generation(
     }
     Ok(info)
 }
-pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::ExitCode> {
+mod machines;
+
+pub fn run(
+    command: Command,
+    inspector: &CpuInspector,
+    tasks: Option<&TaskInspector>,
+    observer: Option<hyper_os::OwnedHandle<hyper_os::handle::ByteChannelObject>>,
+) -> Result<std::process::ExitCode> {
+    let mut machines = machines::Observer::new(observer);
     match command {
         Command::Status => {
             let i = inspector.trace_info()?;
@@ -152,7 +224,16 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
             stop(inspector, info.generation)?;
             let mut cursors = vec![0; info.cpu_count as usize];
             let mut capture = model::Capture::new(info, export.max_events as usize);
-            collect(inspector, &mut capture, &mut cursors, !export.no_names)?;
+            collect(
+                inspector,
+                tasks,
+                &mut capture,
+                &mut cursors,
+                !export.no_names,
+            )?;
+            if !export.no_names {
+                machines.refresh(&mut capture);
+            }
             write(&mut capture, &export, output)?;
         }
         Command::Record {
@@ -168,12 +249,20 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
                 );
             }
             let output = writer(&export)?;
+            // Optional discovery can wait for a slow VM manager. Keep that
+            // wait outside the recording deadline and before workload launch.
+            let vms = if export.no_names {
+                Default::default()
+            } else {
+                machines.prepare()
+            };
             let generation = inspector.trace_start(&config.config())?;
             let mut child = None;
             let result = (|| -> Result<model::Capture> {
                 let info = require_generation(inspector, Some(generation))?;
                 let mut cursors = vec![0; info.cpu_count as usize];
                 let mut capture = model::Capture::new(info, export.max_events as usize);
+                capture.vms = vms;
                 if let Some(program) = command.first() {
                     child = Some(
                         std::process::Command::new(program)
@@ -185,7 +274,16 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
                     // Bounded snapshots keep readers off live producer rings;
                     // export runs only after capture admission has closed.
                     if !snapshot {
-                        collect(inspector, &mut capture, &mut cursors, !export.no_names)?;
+                        collect(
+                            inspector,
+                            tasks,
+                            &mut capture,
+                            &mut cursors,
+                            !export.no_names,
+                        )?;
+                    }
+                    if !export.no_names {
+                        machines.refresh(&mut capture);
                     }
                     if capture.limited {
                         break;
@@ -200,7 +298,13 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
                         // Expiry may have closed admission while a writer still
                         // owns its ring. Join before the final stable-tail read.
                         stop(inspector, generation)?;
-                        collect(inspector, &mut capture, &mut cursors, !export.no_names)?;
+                        collect(
+                            inspector,
+                            tasks,
+                            &mut capture,
+                            &mut cursors,
+                            !export.no_names,
+                        )?;
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(poll_ms));
@@ -216,6 +320,9 @@ pub fn run(command: Command, inspector: &CpuInspector) -> Result<std::process::E
             }
             let mut capture = result?;
             stopped?;
+            if !export.no_names {
+                machines.finish(&mut capture);
+            }
             if let Err(error) = write(&mut capture, &export, output) {
                 if let Some(child) = child.as_mut() {
                     let _ = child.kill();

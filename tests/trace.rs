@@ -4,7 +4,7 @@ use crate::{export, model, options};
 use hyper_os::inspect::trace::TraceInfo;
 use model::{Capture, Event, Site};
 use serde_json::Value;
-fn capture() -> Capture {
+pub(super) fn capture() -> Capture {
     Capture::new(
         TraceInfo {
             generation: 1,
@@ -21,7 +21,14 @@ fn capture() -> Capture {
         128,
     )
 }
-fn add(c: &mut Capture, cpu: usize, time: u64, sequence: u64, name: &str, fields: &[(&str, u64)]) {
+pub(super) fn add(
+    c: &mut Capture,
+    cpu: usize,
+    time: u64,
+    sequence: u64,
+    name: &str,
+    fields: &[(&str, u64)],
+) {
     let site = c.sites.len();
     c.sites.push(Site {
         category: "test".into(),
@@ -43,10 +50,196 @@ fn add(c: &mut Capture, cpu: usize, time: u64, sequence: u64, name: &str, fields
     });
 }
 fn json(c: &mut Capture) -> Result<Value, Box<dyn std::error::Error>> {
+    render(c, true)
+}
+fn render(c: &mut Capture, raw_events: bool) -> Result<Value, Box<dyn std::error::Error>> {
     c.sort();
     let mut bytes = Vec::new();
-    export::perfetto(c, &mut bytes)?;
+    export::chrome(c, &mut bytes, raw_events)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[test]
+fn thread_lanes_follow_migration_without_raw_points() -> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    c.names.insert(42, "io-worker".into());
+    for (cpu, start, end) in [(0, 2000, 4000), (1, 5000, 7000)] {
+        add(
+            &mut c,
+            cpu,
+            start,
+            0,
+            "sched_switch",
+            &[("prev", 1), ("next", 42)],
+        );
+        add(
+            &mut c,
+            cpu,
+            end,
+            1,
+            "sched_switch",
+            &[("prev", 42), ("next", 1)],
+        );
+    }
+    let value = render(&mut c, false)?;
+    let runs: Vec<_> = spans(&value)
+        .into_iter()
+        .filter(|e| e["pid"] == 5)
+        .collect();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["tid"], runs[1]["tid"]);
+    for (cpu, run) in runs.into_iter().enumerate() {
+        assert_eq!(run["name"], "Running");
+        assert_eq!(run["args"]["cpu"], cpu);
+        assert_eq!(run["args"]["switch_in_sequence"], 0);
+        assert_eq!(run["args"]["switch_out_sequence"], 1);
+    }
+    assert!(
+        !value["traceEvents"]
+            .as_array()
+            .ok_or("missing events")?
+            .iter()
+            .any(|e| e["name"] == "sched_switch")
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_bootstrap_switch_preserves_zero_scheduler_id() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut c = capture();
+    c.names.insert(0, "bootstrap".into());
+    add(
+        &mut c,
+        0,
+        2000,
+        0,
+        "sched_switch",
+        &[("prev", 1), ("next", 0), ("state", 1)],
+    );
+    add(
+        &mut c,
+        0,
+        3000,
+        1,
+        "sched_switch",
+        &[("prev", 0), ("next", 1), ("state", 1)],
+    );
+    let value = render(&mut c, false)?;
+    assert!(
+        spans(&value)
+            .iter()
+            .any(|e| e["pid"] == 5 && e["args"]["thread"] == "0x0")
+    );
+    Ok(())
+}
+
+#[test]
+fn overlapping_cpu_observations_do_not_fabricate_parallel_thread_execution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    for (cpu, start, end) in [(0, 2000, 6000), (1, 4000, 8000)] {
+        c.losses[cpu].incomplete = true;
+        add(
+            &mut c,
+            cpu,
+            start,
+            0,
+            "sched_switch",
+            &[("prev", 1), ("next", 42)],
+        );
+        add(
+            &mut c,
+            cpu,
+            end,
+            1,
+            "sched_switch",
+            &[("prev", 42), ("next", 1)],
+        );
+    }
+    let value = render(&mut c, false)?;
+    assert!(spans(&value).is_empty());
+    assert_eq!(value["metadata"]["cross_cpu_spans"], false);
+    Ok(())
+}
+
+#[test]
+fn scheduling_windows_reject_missing_or_inconsistent_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    for mode in ["gap", "identity", "missing-next"] {
+        let mut c = capture();
+        c.losses[0].incomplete = true;
+        add(
+            &mut c,
+            0,
+            2000,
+            0,
+            "sched_switch",
+            &[("prev", 1), ("next", 2)],
+        );
+        if mode == "missing-next" {
+            add(&mut c, 0, 3000, 1, "sched_switch", &[("prev", 2)]);
+        }
+        add(
+            &mut c,
+            0,
+            4000,
+            if mode == "identity" { 1 } else { 2 },
+            "sched_switch",
+            &[
+                ("prev", if mode == "identity" { 7 } else { 2 }),
+                ("next", 3),
+            ],
+        );
+        let value = render(&mut c, false)?;
+        assert!(spans(&value).is_empty(), "{mode}");
+    }
+    Ok(())
+}
+
+#[test]
+fn other_cpu_gaps_do_not_erase_local_execution_windows() -> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    add(
+        &mut c,
+        0,
+        2000,
+        0,
+        "sched_switch",
+        &[("prev", 1), ("next", 2)],
+    );
+    add(&mut c, 1, 3000, 0, "irq_enter", &[("irq", 26)]);
+    add(&mut c, 1, 4000, 2, "irq_exit", &[("irq", 26)]);
+    add(
+        &mut c,
+        0,
+        5000,
+        1,
+        "sched_switch",
+        &[("prev", 2), ("next", 1)],
+    );
+    let value = render(&mut c, false)?;
+    assert_eq!(spans(&value).len(), 2);
+    assert!(spans(&value).iter().all(|e| e["args"]["cpu"] == 0));
+    Ok(())
+}
+
+#[test]
+fn perfetto_cli_defaults_to_timelines() -> Result<(), Box<dyn std::error::Error>> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Args {
+        #[command(subcommand)]
+        command: options::Command,
+    }
+    let args = Args::try_parse_from(["trace", "record"])?;
+    let options::Command::Record { export, .. } = args.command else {
+        return Err("wrong command".into());
+    };
+    assert!(!export.raw_events);
+    assert!(matches!(export.format, options::Format::Perfetto));
+    assert_eq!(export.output, "/tmp/trace.pftrace");
+    Ok(())
 }
 fn spans(value: &Value) -> Vec<&Value> {
     value["traceEvents"]
@@ -124,10 +317,10 @@ fn causal_delivery_is_directional_and_needs_committed_receive()
     assert_eq!(flows(&value).len(), 2);
     assert_ne!(flows(&value)[0]["bind_id"], flows(&value)[1]["bind_id"]);
     c.losses[1].overwritten = 1;
-    assert!(flows(&json(&mut c)?).is_empty());
+    assert_eq!(flows(&json(&mut c)?).len(), 2);
     c.losses[1].overwritten = 0;
     c.info.cpu_mask[0] = 1;
-    assert!(flows(&json(&mut c)?).is_empty());
+    assert_eq!(flows(&json(&mut c)?).len(), 2);
     Ok(())
 }
 
@@ -183,7 +376,7 @@ fn equal_time_message_delivery_does_not_depend_on_cpu_or_read_order()
                     std::fs::write(path, serde_json::to_vec(&value)?)?;
                 }
                 c.losses[0].incomplete = true;
-                assert!(flows(&json(&mut c)?).is_empty());
+                assert_eq!(flows(&json(&mut c)?).len(), 1);
             }
         }
     }
@@ -213,6 +406,36 @@ fn earlier_or_mismatched_receives_do_not_form_delivery_flows()
         );
         assert!(flows(&json(&mut c)?).is_empty());
     }
+    Ok(())
+}
+
+#[test]
+fn equal_time_block_completion_matches_across_cpus_after_unrelated_loss()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    add(
+        &mut c,
+        0,
+        2000,
+        0,
+        "block_complete",
+        &[("domain", 1), ("tag", 42)],
+    );
+    add(
+        &mut c,
+        1,
+        2000,
+        0,
+        "block_submit",
+        &[("domain", 1), ("tag", 42), ("read", 1)],
+    );
+    c.losses[1].incomplete = true;
+    let v = json(&mut c)?;
+    assert!(
+        spans(&v)
+            .iter()
+            .any(|e| e["pid"] == 4 && e["name"] == "read" && e["dur"] == 0.0)
+    );
     Ok(())
 }
 
@@ -360,7 +583,7 @@ fn explicit_rpc_parent_wait_and_message_flows_import_fixture()
         15000,
         3,
         "sched_switch",
-        &[("prev", 30), ("next", 10), ("prev_state", 4)],
+        &[("prev", 30), ("next", 10), ("state", 4)],
     );
     add(
         &mut c,
@@ -399,6 +622,11 @@ fn explicit_rpc_parent_wait_and_message_flows_import_fixture()
     // Optional artifact for the real upstream TraceProcessor import contract.
     if let Some(path) = std::env::var_os("HYPER_TRACE_FIXTURE") {
         std::fs::write(path, serde_json::to_vec(&value)?)?;
+    }
+    if let Some(path) = std::env::var_os("HYPER_TRACE_PROTO_RPC_FIXTURE") {
+        let mut output = Vec::new();
+        export::perfetto(&c, &mut output, false)?;
+        std::fs::write(path, output)?;
     }
     Ok(())
 }
@@ -563,8 +791,9 @@ fn missing_events_never_form_a_complete_syscall() -> Result<(), Box<dyn std::err
     Ok(())
 }
 #[test]
-fn unknown_loss_disables_inferred_durations() -> Result<(), Box<dyn std::error::Error>> {
+fn incomplete_data_keeps_names_and_capture_metadata() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = capture();
+    c.names.insert(2, "io-runtime".into());
     c.losses[0].incomplete = true;
     add(
         &mut c,
@@ -572,7 +801,7 @@ fn unknown_loss_disables_inferred_durations() -> Result<(), Box<dyn std::error::
         2000,
         0,
         "sched_switch",
-        &[("prev", 1), ("next", 2), ("prev_state", 1)],
+        &[("prev", 1), ("next", 2), ("state", 1)],
     );
     add(
         &mut c,
@@ -580,11 +809,30 @@ fn unknown_loss_disables_inferred_durations() -> Result<(), Box<dyn std::error::
         4000,
         1,
         "sched_switch",
-        &[("prev", 2), ("next", 1), ("prev_state", 4)],
+        &[("prev", 2), ("next", 1), ("state", 4)],
     );
-    let value = json(&mut c)?;
-    assert!(spans(&value).is_empty());
+    let value = render(&mut c, false)?;
+    let runs = spans(&value);
+    assert_eq!(runs.len(), 2);
+    assert!(
+        runs.iter()
+            .any(|run| run["pid"] == 5 && run["name"] == "Running")
+    );
     assert_eq!(value["metadata"]["losses"][0]["incomplete"], true);
+    assert!(
+        runs.iter()
+            .any(|run| run["pid"] == 1 && run["name"] == "io-runtime")
+    );
+    assert!(
+        !value["traceEvents"]
+            .as_array()
+            .ok_or("missing events")?
+            .iter()
+            .any(|e| matches!(
+                e["name"].as_str(),
+                Some("Incomplete trace data" | "TRACE LOSS" | "TRACE GAP")
+            ))
+    );
     Ok(())
 }
 #[test]
@@ -606,7 +854,7 @@ fn runnable_latency_and_cpu_spans_require_both_boundaries() -> Result<(), Box<dy
         3000,
         0,
         "sched_switch",
-        &[("prev", 1), ("next", 2), ("prev_state", 4)],
+        &[("prev", 1), ("next", 2), ("state", 4)],
     );
     add(
         &mut c,
@@ -614,11 +862,11 @@ fn runnable_latency_and_cpu_spans_require_both_boundaries() -> Result<(), Box<dy
         6000,
         1,
         "sched_switch",
-        &[("prev", 2), ("next", 1), ("prev_state", 4)],
+        &[("prev", 2), ("next", 1), ("state", 4)],
     );
     let value = json(&mut c)?;
     let items = spans(&value);
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3);
     assert!(
         items
             .iter()
@@ -691,6 +939,7 @@ fn record_cli_covers_limits_output_and_workload() -> Result<(), Box<dyn std::err
         "--output",
         "/tmp/a",
         "--no-names",
+        "--raw-events",
         "--fail-on-loss",
         "--snapshot",
         "--",
@@ -709,7 +958,7 @@ fn record_cli_covers_limits_output_and_workload() -> Result<(), Box<dyn std::err
             assert_eq!(capture.categories, 36);
             assert_eq!(capture.buffer_records, 64);
             assert_eq!(export.max_events, 100);
-            assert!(export.no_names && export.fail_on_loss);
+            assert!(export.no_names && export.fail_on_loss && export.raw_events);
             assert_eq!(poll_ms, 1);
             assert!(snapshot);
             assert_eq!(command, ["/bin/echo", "ok"]);
@@ -840,6 +1089,257 @@ fn lost_other_cpu_prefix_or_tail_cannot_join_distinct_invocations()
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0]["name"], "IRQ 26");
         assert_eq!(value["metadata"]["cross_cpu_spans"], false);
+    }
+    Ok(())
+}
+
+#[test]
+fn switch_causes_are_explicit_and_never_inferred_from_ready_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (reason, point, name, preempted) in [
+        (1, 3, "yield", Some(false)),
+        (2, 3, "preempt", Some(true)),
+        (3, 3, "block", Some(false)),
+        (4, 3, "exit", Some(false)),
+        (5, 3, "migrate", Some(true)),
+        (5, 2, "migrate", Some(true)),
+        (5, 1, "migrate", Some(false)),
+        (5, 99, "migrate", None),
+        (6, 3, "idle-dispatch", Some(false)),
+        (99, 3, "unknown", None),
+    ] {
+        let mut c = capture();
+        add(
+            &mut c,
+            0,
+            2000,
+            0,
+            "sched_switch",
+            &[("prev", 1), ("next", 2), ("state", 1)],
+        );
+        add(
+            &mut c,
+            0,
+            3000,
+            1,
+            "sched_switch",
+            &[
+                ("prev", 2),
+                ("next", 3),
+                ("state", 1 | (2 << 8)),
+                ("cause", reason | (point << 8)),
+            ],
+        );
+        let value = json(&mut c)?;
+        let slices: Vec<_> = spans(&value)
+            .into_iter()
+            .filter(|s| s["pid"] == 1)
+            .collect();
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0]["args"]["switch_out_reason"], name);
+        let switch = value["traceEvents"]
+            .as_array()
+            .ok_or("missing events")?
+            .iter()
+            .rev()
+            .find(|e| e["name"] == "sched_switch")
+            .ok_or("missing switch")?;
+        assert_eq!(switch["args"]["prev_state"], 1);
+        assert_eq!(switch["args"]["next_class"], 2);
+        assert_eq!(slices[0]["args"]["preempted"], serde_json::json!(preempted));
+        assert_eq!(
+            slices[0]["args"]["schedule_point"],
+            match point {
+                1 => "explicit",
+                2 => "safe-point",
+                3 => "irq-tail",
+                _ => "unknown",
+            }
+        );
+    }
+    // Missing cause metadata must not infer preemption from Ready state.
+    let mut c = capture();
+    add(
+        &mut c,
+        0,
+        2000,
+        0,
+        "sched_switch",
+        &[("prev", 1), ("next", 2), ("state", 1)],
+    );
+    let value = json(&mut c)?;
+    let switch = value["traceEvents"]
+        .as_array()
+        .ok_or("missing events")?
+        .iter()
+        .find(|e| e["name"] == "sched_switch")
+        .ok_or("missing switch")?;
+    assert!(switch["args"]["preempted"].is_null());
+    Ok(())
+}
+
+#[test]
+fn switch_cause_is_atomic_even_after_loss() -> Result<(), Box<dyn std::error::Error>> {
+    for incomplete in [false, true] {
+        let mut c = capture();
+        add(
+            &mut c,
+            0,
+            2000,
+            0,
+            "sched_switch",
+            &[
+                ("prev", 1),
+                ("next", 2),
+                ("state", 1),
+                ("cause", 1 | (1 << 8)),
+            ],
+        );
+        add(
+            &mut c,
+            0,
+            3000,
+            2,
+            "sched_switch",
+            &[
+                ("prev", 2),
+                ("next", 3),
+                ("state", 1),
+                ("cause", 2 | (3 << 8)),
+            ],
+        );
+        c.losses[0].incomplete = incomplete;
+        let value = json(&mut c)?;
+        assert!(spans(&value).is_empty());
+        let switch = value["traceEvents"]
+            .as_array()
+            .ok_or("missing events")?
+            .iter()
+            .rev()
+            .find(|e| e["name"] == "sched_switch")
+            .ok_or("missing switch")?;
+        assert_eq!(switch["args"]["preempted"], true);
+        assert_eq!(switch["args"]["schedule_point"], "irq-tail");
+    }
+    Ok(())
+}
+
+#[test]
+fn mismatched_nested_irq_boundaries_discard_outer_context() -> Result<(), Box<dyn std::error::Error>>
+{
+    for kind_mismatch in [false, true] {
+        let mut c = capture();
+        add(&mut c, 0, 2000, 0, "irq_enter", &[("irq", 26)]);
+        add(&mut c, 0, 3000, 1, "irq_enter", &[("irq", 7)]);
+        add(
+            &mut c,
+            0,
+            4000,
+            2,
+            "irq_exit",
+            &[
+                ("irq", if kind_mismatch { 7 } else { 8 }),
+                ("irq_kind", u64::from(kind_mismatch)),
+            ],
+        );
+        add(&mut c, 0, 5000, 3, "sched_request", &[("reason", 1)]);
+        add(&mut c, 0, 6000, 4, "irq_exit", &[("irq", 26)]);
+        // A fresh complete interval must still be usable after resynchronizing.
+        add(&mut c, 0, 7000, 5, "irq_enter", &[("irq", 30)]);
+        add(&mut c, 0, 8000, 6, "irq_exit", &[("irq", 30)]);
+        let value = json(&mut c)?;
+        let intervals = spans(&value);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0]["name"], "IRQ 30");
+        let request = value["traceEvents"]
+            .as_array()
+            .ok_or("missing events")?
+            .iter()
+            .find(|e| e["name"] == "sched_request")
+            .ok_or("missing request")?;
+        assert!(request["args"]["irq_context"].is_null());
+    }
+    Ok(())
+}
+
+#[test]
+fn reschedule_irq_context_requires_matching_local_complete_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    for mode in [
+        "physical",
+        "nested",
+        "private",
+        "missing-exit",
+        "gap",
+        "mismatch",
+        "other-cpu",
+    ] {
+        let mut c = capture();
+        let kind = u64::from(mode == "private");
+        add(
+            &mut c,
+            0,
+            2000,
+            0,
+            "irq_enter",
+            &[("irq", 26), ("irq_kind", kind)],
+        );
+        let mut seq = 1;
+        if mode == "nested" {
+            add(&mut c, 0, 2500, seq, "irq_enter", &[("irq", 7)]);
+            seq += 1;
+        }
+        let cpu = usize::from(mode == "other-cpu");
+        add(
+            &mut c,
+            cpu,
+            3000,
+            if cpu == 0 { seq } else { 0 },
+            "sched_request",
+            &[("reason", 2), ("target_cpu", 1)],
+        );
+        seq += 1;
+        if mode == "nested" {
+            add(&mut c, 0, 3500, seq, "irq_exit", &[("irq", 7)]);
+            seq += 1;
+        }
+        if mode != "missing-exit" {
+            add(
+                &mut c,
+                0,
+                4000,
+                if mode == "gap" {
+                    seq + 1
+                } else if cpu == 1 {
+                    1
+                } else {
+                    seq
+                },
+                "irq_exit",
+                &[
+                    ("irq", if mode == "mismatch" { 30 } else { 26 }),
+                    ("irq_kind", kind),
+                ],
+            );
+        }
+        let value = json(&mut c)?;
+        let event = value["traceEvents"]
+            .as_array()
+            .ok_or("missing events")?
+            .iter()
+            .find(|e| e["name"] == "sched_request")
+            .ok_or("missing request")?;
+        assert_eq!(event["args"]["request_source"], "scheduler-deadline");
+        let context = &event["args"]["irq_context"];
+        match mode {
+            "physical" => assert_eq!(context["irq"], 26),
+            "nested" => assert_eq!(context["irq"], 7),
+            "private" => {
+                assert_eq!(context["kind"], "kernel-rpc");
+                assert!(context["irq"].is_null());
+            }
+            _ => assert!(context.is_null(), "{mode}"),
+        }
     }
     Ok(())
 }

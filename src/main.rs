@@ -166,7 +166,14 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     hyper_os::require_core_abi()?;
     let inspector = CpuInspector::from_handle(startup.take(hyper_os::startup::CPU_INSPECTOR)?);
     match args.command {
-        Command::Trace { command } => return trace::run(command, &inspector),
+        Command::Trace { command } => {
+            let tasks = startup
+                .take(hyper_os::startup::TASK_INSPECTOR)
+                .ok()
+                .map(hyper_os::inspect::TaskInspector::from_handle);
+            let observer = startup.take(hyper_service::vm::TRACE_OBSERVER).ok();
+            return trace::run(command, &inspector, tasks.as_ref(), observer);
+        }
         Command::Start { seconds, period } => {
             let id = inspector.profile_start(period, seconds)?;
             println!("perf: capture {id} started, period {period} cycles, limit {seconds}s");

@@ -72,15 +72,21 @@ impl Capture {
 }
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Format {
+    /// Native Perfetto protobuf with CPU scheduling and thread-state tables.
     Perfetto,
+    /// Chrome Trace JSON, useful for inspecting the exported events.
+    Chrome,
     Jsonl,
 }
 #[derive(Args)]
 pub struct Export {
+    /// Include raw instant tracepoints in Perfetto output. JSONL is always raw.
+    #[arg(long)]
+    pub raw_events: bool,
     /// Output file. '-' writes stdout; a workload command requires a real file.
-    #[arg(short, long, default_value = "/tmp/trace.json")]
+    #[arg(short, long, default_value = "/tmp/trace.pftrace")]
     pub output: String,
-    /// Perfetto accepts the generated Chrome Trace JSON directly.
+    /// Native Perfetto protobuf, diagnostic Chrome JSON, or raw JSONL.
     #[arg(long, value_enum, default_value = "perfetto")]
     pub format: Format,
     /// Bound collector storage (roughly 64 bytes/event, plus site/name metadata).

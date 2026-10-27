@@ -26,11 +26,27 @@ pub struct Loss {
     pub overwritten: u64,
     pub incomplete: bool,
 }
+#[derive(Clone, Debug)]
+pub struct Task {
+    pub process: Option<u64>,
+    pub idle: bool,
+}
+#[derive(Clone, Debug)]
+pub struct VmThread {
+    pub name: String,
+    pub vcpu: u32,
+}
 pub struct Capture {
     pub info: TraceInfo,
     pub sites: Vec<Site>,
     pub events: Vec<Event>,
     pub names: BTreeMap<u64, String>,
+    pub tasks: BTreeMap<u64, Task>,
+    pub koids: BTreeMap<u64, u64>,
+    pub processes: BTreeMap<u64, String>,
+    /// VM-owner observations keyed by the actual scheduler `ThreadId`.
+    pub vms: BTreeMap<u64, VmThread>,
+    pub vcpu_threads: std::collections::BTreeSet<u64>,
     pub losses: Vec<Loss>,
     pub limited: bool,
     pub limit: usize,
@@ -49,6 +65,11 @@ impl Capture {
             sites: Vec::new(),
             events: Vec::new(),
             names: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            koids: BTreeMap::new(),
+            processes: BTreeMap::new(),
+            vms: BTreeMap::new(),
+            vcpu_threads: Default::default(),
             losses,
             limited: false,
             limit,
@@ -62,6 +83,14 @@ impl Capture {
         if self.events.len() >= self.limit {
             self.limited = true;
             return Ok(false);
+        }
+        // Retired threads may be gone before live metadata inspection. Preserve
+        // their canonical identity from the committed retirement observation.
+        if record.name == "sched_reap"
+            && let (Some(thread), Some(koid)) = (record.value("thread"), record.value("koid"))
+            && koid != 0
+        {
+            self.koids.insert(thread, koid);
         }
         // A small site catalogue avoids allocating a search key per event.
         // Compare all metadata: source names can be truncated on the wire.

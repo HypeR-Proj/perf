@@ -8,5 +8,8 @@ pub mod model;
 #[path = "trace/options.rs"]
 pub mod options;
 #[cfg(test)]
+#[path = "../tests/protobuf.rs"]
+mod proto_tests;
+#[cfg(test)]
 #[path = "../tests/trace.rs"]
 mod tests;

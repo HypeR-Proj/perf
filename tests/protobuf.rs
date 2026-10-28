@@ -86,22 +86,25 @@ fn native_capture() -> crate::model::Capture {
     );
     for (time, seq, name, tag) in [
         (8000, 2, "block_submit", 1),
-        (9000, 3, "block_submit", 2),
-        (10000, 4, "block_complete", 1),
-        (11000, 5, "block_complete", 2),
+        (8001, 3, "block_command", 1),
+        (9000, 4, "block_submit", 2),
+        (9001, 5, "block_command", 2),
+        (10000, 6, "block_complete", 1),
+        (11000, 7, "block_complete", 2),
     ] {
-        add(
-            &mut c,
-            1,
-            time,
-            seq,
-            name,
-            &[("domain", 90), ("tag", tag), ("bytes", 4096), ("read", 1)],
-        );
+        let fields = if name == "block_command" {
+            [
+                ("domain", 90),
+                ("tag", tag),
+                ("slot", tag - 1),
+                ("opcode", 0x88),
+            ]
+        } else {
+            [("domain", 90), ("tag", tag), ("bytes", 4096), ("read", 1)]
+        };
+        add(&mut c, 1, time, seq, name, &fields);
     }
     add(&mut c, 0, 12000, 5, "sched_reap", &[("thread", worker)]);
-    // Producer contention elsewhere must not erase matching device identities.
-    c.losses[1].incomplete = true;
     c.sort();
     c
 }

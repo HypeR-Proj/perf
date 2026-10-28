@@ -13,6 +13,12 @@ pub enum Command {
         #[arg(long)]
         generation: Option<u64>,
     },
+    /// Release a stopped capture's buffers and invalidate its generation.
+    Clear {
+        /// Reject control if a different capture has replaced this generation.
+        #[arg(long)]
+        generation: Option<u64>,
+    },
     /// Show capture state, kernel identity, selected CPUs and buffer bounds.
     Status,
     /// Stop and export the retained tail of a capture.
@@ -50,8 +56,8 @@ pub struct Capture {
     /// Online CPU indices/ranges (for example 0,2-3); all selects every online CPU.
     #[arg(long, default_value = "all", value_parser = cpus)]
     pub cpus: CpuSelection,
-    /// Retained records per CPU; does not change the compiled maximum allocation.
-    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u64).range(64..=4096))]
+    /// Records allocated per selected CPU when capture starts; retained until clear.
+    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u64).range(64..=16384))]
     pub buffer_records: u64,
 }
 #[derive(Clone, Debug)]

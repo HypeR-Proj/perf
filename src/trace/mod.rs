@@ -218,6 +218,11 @@ pub fn run(
             stop(inspector, info.generation)?;
             println!("perf trace: capture {} stopped", info.generation);
         }
+        Command::Clear { generation } => {
+            let info = require_generation(inspector, generation)?;
+            inspector.trace_clear(info.generation)?;
+            println!("perf trace: capture {} cleared", info.generation);
+        }
         Command::Dump { export, generation } => {
             let info = require_generation(inspector, generation)?;
             let output = writer(&export)?;

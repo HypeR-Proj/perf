@@ -13,7 +13,7 @@ pub(super) fn capture() -> Capture {
             categories: 127,
             cpu_count: 2,
             capacity: 64,
-            maximum_capacity: 4096,
+            maximum_capacity: 16384,
             running: 0,
             cpu_mask: core::array::from_fn(|i| if i == 0 { 3 } else { 0 }),
             revision: [0; 64],
@@ -410,7 +410,7 @@ fn earlier_or_mismatched_receives_do_not_form_delivery_flows()
 }
 
 #[test]
-fn equal_time_block_completion_matches_across_cpus_after_unrelated_loss()
+fn loss_keeps_block_boundaries_raw_without_inventing_command_slots()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut c = capture();
     add(
@@ -431,11 +431,16 @@ fn equal_time_block_completion_matches_across_cpus_after_unrelated_loss()
     );
     c.losses[1].incomplete = true;
     let v = json(&mut c)?;
-    assert!(
-        spans(&v)
-            .iter()
-            .any(|e| e["pid"] == 4 && e["name"] == "read" && e["dur"] == 0.0)
-    );
+    assert!(spans(&v).iter().all(|e| e["pid"] != 4));
+    for name in ["block_submit", "block_complete"] {
+        assert!(
+            v["traceEvents"]
+                .as_array()
+                .ok_or("missing events")?
+                .iter()
+                .any(|e| e["ph"] == "i" && e["name"] == name)
+        );
+    }
     Ok(())
 }
 
@@ -973,6 +978,16 @@ fn record_cli_covers_limits_output_and_workload() -> Result<(), Box<dyn std::err
     ] {
         assert!(Args::try_parse_from(["trace", "record", flag, "0"]).is_err());
     }
+    for arguments in [
+        vec!["trace", "start"],
+        vec!["trace", "start", "--buffer-records", "16384"],
+    ] {
+        match Args::try_parse_from(arguments)?.command {
+            options::Command::Start(capture) => assert_eq!(capture.config().capacity, 16384),
+            _ => return Err("wrong command".into()),
+        }
+    }
+    assert!(Args::try_parse_from(["trace", "start", "--buffer-records", "16385"]).is_err());
     Ok(())
 }
 
@@ -1031,8 +1046,16 @@ fn failed_syscall_and_io_completion_preserve_outcomes() -> Result<(), Box<dyn st
     add(
         &mut c,
         1,
-        4000,
+        3000,
         1,
+        "block_command",
+        &[("domain", 7), ("tag", 1), ("slot", 0), ("opcode", 0x88)],
+    );
+    add(
+        &mut c,
+        1,
+        4000,
+        2,
         "block_complete",
         &[("domain", 7), ("tag", 1), ("success", 0)],
     );
@@ -1340,6 +1363,502 @@ fn reschedule_irq_context_requires_matching_local_complete_boundaries()
             }
             _ => assert!(context.is_null(), "{mode}"),
         }
+    }
+    Ok(())
+}
+
+fn block_event(c: &mut Capture, cpu: usize, time: u64, name: &str, fields: &[(&str, u64)]) {
+    let sequence = c.events.iter().filter(|event| event.cpu == cpu).count() as u64;
+    add(c, cpu, time, sequence, name, fields);
+}
+
+fn physical_command(c: &mut Capture, tag: u64, slot: u64, opcode: u64, start: u64, end: u64) {
+    block_event(
+        c,
+        0,
+        start,
+        "block_submit",
+        &[("domain", 7), ("tag", tag), ("bytes", 1024), ("read", 0)],
+    );
+    block_event(
+        c,
+        0,
+        start + 1,
+        "block_command",
+        &[
+            ("domain", 7),
+            ("tag", tag),
+            ("slot", slot),
+            ("opcode", opcode),
+        ],
+    );
+    block_event(
+        c,
+        0,
+        end,
+        "block_complete",
+        &[("domain", 7), ("tag", tag), ("success", 1)],
+    );
+}
+
+#[test]
+fn block_many_to_many_dispatch_and_retained_completions() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut c = capture();
+    for request in [1, 2] {
+        block_event(
+            &mut c,
+            1,
+            2000 + request,
+            "block_queued",
+            &[
+                ("domain", 7),
+                ("request", request),
+                ("queue", 9),
+                ("ticket", 0x100 + request),
+            ],
+        );
+        block_event(
+            &mut c,
+            1,
+            2010 + request,
+            "block_origin",
+            &[
+                ("domain", 7),
+                ("request", request),
+                ("thread", 99),
+                ("operation", 1),
+            ],
+        );
+    }
+    // Batch 1 contributes two fragments to command 1. Batch 2 spans both
+    // concurrently outstanding commands. A logical ticket is not a DMA tag.
+    physical_command(&mut c, 1, 0, 0x8a, 3000, 5000);
+    physical_command(&mut c, 2, 1, 0x8a, 3100, 4500);
+    for (tag, request, bytes, time) in [
+        (1, 1, 256, 3010),
+        (1, 1, 256, 3020),
+        (1, 2, 512, 3030),
+        (2, 2, 1024, 3110),
+    ] {
+        block_event(
+            &mut c,
+            0,
+            time,
+            "block_link",
+            &[
+                ("domain", 7),
+                ("tag", tag),
+                ("request", request),
+                ("bytes", bytes),
+            ],
+        );
+    }
+    for request in [1, 2] {
+        block_event(
+            &mut c,
+            1,
+            5100 + request,
+            "block_ready",
+            &[
+                ("domain", 7),
+                ("request", request),
+                ("status", 0),
+                ("bytes", if request == 1 { 512 } else { 1536 }),
+            ],
+        );
+        block_event(
+            &mut c,
+            1,
+            6100 + request,
+            "block_release",
+            &[("domain", 7), ("request", request), ("queue", 9)],
+        );
+    }
+    // Renumber in chronological order per CPU, as the real producer does.
+    c.sort();
+    for cpu in 0..2 {
+        for (sequence, e) in c.events.iter_mut().filter(|e| e.cpu == cpu).enumerate() {
+            e.sequence = sequence as u64;
+        }
+    }
+    let value = json(&mut c)?;
+    let physical: Vec<_> = spans(&value)
+        .into_iter()
+        .filter(|e| e["pid"] == 4 && e["name"] == "write")
+        .collect();
+    assert_eq!(physical.len(), 2);
+    assert_ne!(physical[0]["tid"], physical[1]["tid"]);
+    let dispatch: Vec<_> = flows(&value)
+        .into_iter()
+        .filter(|e| e["name"] == "Block dispatch")
+        .collect();
+    assert_eq!(dispatch.len(), 3);
+    assert!(
+        dispatch
+            .iter()
+            .any(|e| e["args"]["request"] == "0x1" && e["args"]["bytes"] == 512)
+    );
+    assert_eq!(
+        flows(&value)
+            .iter()
+            .filter(|e| e["name"] == "Block completion")
+            .count(),
+        3
+    );
+    assert_eq!(
+        spans(&value)
+            .iter()
+            .filter(|e| e["name"] == "Completion retained" && e["dur"] == 1.0)
+            .count(),
+        2
+    );
+    assert_eq!(
+        spans(&value)
+            .iter()
+            .filter(|e| e["name"] == "Dispatch delay")
+            .count(),
+        2
+    );
+    let counts: Vec<_> = value["traceEvents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["ph"] == "C" && e["pid"] == 6)
+        .map(|e| &e["args"]["in flight"])
+        .collect();
+    assert_eq!(
+        counts,
+        vec![
+            &Value::from(1),
+            &Value::from(2),
+            &Value::from(1),
+            &Value::from(0)
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn block_equal_timestamps_do_not_depend_on_cpu_order() -> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    let device = (1u64 << 60) + 7;
+    let request = (1u64 << 60) + 9;
+    block_event(
+        &mut c,
+        1,
+        2000,
+        "block_queued",
+        &[
+            ("domain", device),
+            ("request", request),
+            ("queue", 1),
+            ("ticket", 0x101),
+        ],
+    );
+    block_event(
+        &mut c,
+        1,
+        2000,
+        "block_origin",
+        &[
+            ("domain", device),
+            ("request", request),
+            ("thread", 99),
+            ("operation", 2),
+        ],
+    );
+    block_event(
+        &mut c,
+        0,
+        2000,
+        "block_submit",
+        &[("domain", device), ("tag", 1), ("bytes", 0), ("read", 0)],
+    );
+    block_event(
+        &mut c,
+        0,
+        2000,
+        "block_command",
+        &[
+            ("domain", device),
+            ("tag", 1),
+            ("slot", 0),
+            ("opcode", 0x91),
+        ],
+    );
+    block_event(
+        &mut c,
+        0,
+        2000,
+        "block_link",
+        &[
+            ("domain", device),
+            ("tag", 1),
+            ("request", request),
+            ("bytes", 0),
+        ],
+    );
+    block_event(
+        &mut c,
+        0,
+        2000,
+        "block_complete",
+        &[("domain", device), ("tag", 1), ("success", 1)],
+    );
+    block_event(
+        &mut c,
+        1,
+        2000,
+        "block_ready",
+        &[
+            ("domain", device),
+            ("request", request),
+            ("status", 0),
+            ("bytes", 0),
+        ],
+    );
+    let value = json(&mut c)?;
+    assert!(
+        spans(&value)
+            .iter()
+            .any(|e| e["name"] == "flush" && e["dur"] == 0.0)
+    );
+    assert_eq!(
+        flows(&value)
+            .iter()
+            .filter(|e| e["name"] == "Block dispatch")
+            .count(),
+        1
+    );
+    assert_eq!(
+        flows(&value)
+            .iter()
+            .filter(|e| e["name"] == "Block completion")
+            .count(),
+        1
+    );
+    let counters: Vec<_> = value["traceEvents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["ph"] == "C")
+        .collect();
+    assert_eq!(counters[1]["args"]["in flight"], 0);
+    let bytes = serde_json::to_vec(&value)?;
+    if let Some(path) = std::env::var_os("HYPER_BLOCK_TRACE_FIXTURE") {
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn block_loss_ambiguity_and_unmatched_boundaries_never_invent_commands()
+-> Result<(), Box<dyn std::error::Error>> {
+    for variant in 0..7 {
+        let mut c = capture();
+        physical_command(&mut c, 1, 0, 0x88, 2000, 4000);
+        match variant {
+            0 => c.losses[1].incomplete = true,
+            1 => c.info.cpu_mask[0] = 1,
+            2 => c.events[1].sequence = 9,
+            3 => c.events[1].site = c.events[0].site, // duplicate begin, no slot metadata
+            4 => {
+                block_event(&mut c, 0, 5000, "block_abort", &[("domain", 7), ("tag", 1)]);
+            }
+            5 => c.events[2].time = 1500,
+            _ => {
+                c.events.pop();
+            }
+        }
+        let value = json(&mut c)?;
+        assert!(
+            spans(&value).iter().all(|e| e["pid"] != 4),
+            "variant {variant}"
+        );
+        assert!(flows(&value).is_empty());
+        assert!(
+            value["traceEvents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| e["ph"] == "i" && e["name"] == "block_submit")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn block_abort_and_cancelled_batch_are_not_successful_device_completions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    physical_command(&mut c, 1, 0, 0x8a, 2000, 4000);
+    let site = c.events[2].site;
+    c.sites[site].name = "block_abort".into();
+    // Unrelated future records with the same tag must never consume a command.
+    block_event(
+        &mut c,
+        1,
+        3000,
+        "future_diagnostic",
+        &[("domain", 7), ("tag", 1)],
+    );
+    block_event(
+        &mut c,
+        1,
+        5000,
+        "block_queued",
+        &[
+            ("domain", 7),
+            ("request", 2),
+            ("queue", 9),
+            ("ticket", 0x101),
+        ],
+    );
+    block_event(
+        &mut c,
+        1,
+        6000,
+        "block_ready",
+        &[
+            ("domain", 7),
+            ("request", 2),
+            ("status", (-18i64) as u64),
+            ("bytes", 0),
+        ],
+    );
+    block_event(
+        &mut c,
+        1,
+        7000,
+        "block_release",
+        &[("domain", 7), ("request", 2), ("queue", 9)],
+    );
+    let value = json(&mut c)?;
+    assert!(spans(&value).iter().any(|e| e["name"] == "aborted command"));
+    assert!(
+        spans(&value)
+            .iter()
+            .any(|e| e["name"] == "Block batch" && e["args"]["completion"]["status"] == -18)
+    );
+    assert!(flows(&value).is_empty());
+    Ok(())
+}
+
+#[test]
+fn block_ticket_slot_reuse_preserves_identity_and_unknown_actor_is_not_a_caller()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    for request in [1, 2] {
+        let time = request * 4000;
+        block_event(
+            &mut c,
+            0,
+            time,
+            "block_queued",
+            &[
+                ("domain", 7),
+                ("request", request),
+                ("queue", 9),
+                ("ticket", (request << 8) | 1),
+            ],
+        );
+        block_event(
+            &mut c,
+            0,
+            time + 1,
+            "block_origin",
+            &[
+                ("domain", 7),
+                ("request", request),
+                ("thread", 0),
+                ("operation", 1),
+            ],
+        );
+        block_event(
+            &mut c,
+            0,
+            time + 1000,
+            "block_ready",
+            &[
+                ("domain", 7),
+                ("request", request),
+                ("status", (-18i64) as u64),
+                ("bytes", 0),
+            ],
+        );
+        block_event(
+            &mut c,
+            0,
+            time + 2000,
+            "block_release",
+            &[("domain", 7), ("request", request), ("queue", 9)],
+        );
+    }
+    let value = json(&mut c)?;
+    let batches: Vec<_> = spans(&value)
+        .into_iter()
+        .filter(|e| e["name"] == "Block batch")
+        .collect();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0]["tid"], batches[1]["tid"]);
+    assert_ne!(batches[0]["args"]["request"], batches[1]["args"]["request"]);
+    assert!(flows(&value).is_empty());
+    Ok(())
+}
+
+#[test]
+fn logical_block_tracks_survive_native_export_without_aliasing_scheduler_tracks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut c = capture();
+    block_event(
+        &mut c,
+        0,
+        2000,
+        "block_queued",
+        &[
+            ("domain", 7),
+            ("request", 1),
+            ("queue", 9),
+            ("ticket", 0x101),
+        ],
+    );
+    block_event(
+        &mut c,
+        0,
+        3000,
+        "block_ready",
+        &[("domain", 7), ("request", 1), ("status", 0), ("bytes", 512)],
+    );
+    block_event(
+        &mut c,
+        0,
+        4000,
+        "block_release",
+        &[("domain", 7), ("request", 1), ("queue", 9)],
+    );
+    let value = json(&mut c)?;
+    for name in ["Block batch", "Completion retained"] {
+        let span = spans(&value)
+            .into_iter()
+            .find(|event| event["name"] == name)
+            .ok_or("missing block interval")?;
+        assert_eq!(span["pid"], 7);
+    }
+    let mut native = Vec::new();
+    export::perfetto(&c, &mut native, false)?;
+    // The native writer discards synthetic scheduler tracks. Block intervals
+    // must retain their own descriptors and spans in the default output format.
+    for name in [
+        "HypeR logical block batches",
+        "Block batch",
+        "Completion retained",
+    ] {
+        assert!(
+            native
+                .windows(name.len())
+                .any(|bytes| bytes == name.as_bytes())
+        );
     }
     Ok(())
 }

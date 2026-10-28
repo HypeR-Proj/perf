@@ -425,3 +425,120 @@ fn interleaved_rpc_intervals_preserve_wire_endpoints() -> Result<(), Box<dyn std
     }
     Ok(())
 }
+
+#[test]
+fn retired_thread_keeps_process_group_from_recorded_syscalls()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyper_os::inspect::trace::{Category, TraceRecord};
+    let thread = 0x8e000010;
+    let thread_koid = (9u64 << 32) | 33;
+    let process = (4u64 << 32) | 69;
+    // Collection drains CPUs independently: retirement can arrive before entry.
+    for reap_first in [false, true] {
+        for named in [false, true] {
+            let mut c = capture();
+            if named {
+                c.processes.insert(process, "ls".into());
+                c.tasks.insert(
+                    thread,
+                    Task {
+                        process: Some(process),
+                        idle: false,
+                    },
+                );
+                c.names.insert(thread, "ls-main".into());
+            }
+            let syscall = TraceRecord {
+                sequence: 0,
+                timestamp_ns: 2000,
+                category: Category::Syscall,
+                name: "syscall_enter",
+                source: "test",
+                line: 1,
+                fields: [
+                    ("thread", thread),
+                    ("process", process),
+                    ("kind", 13),
+                    ("operation", 256),
+                ],
+                field_count: 4,
+            };
+            let reap = TraceRecord {
+                sequence: 0,
+                timestamp_ns: 3000,
+                category: Category::Scheduler,
+                name: "sched_reap",
+                source: "test",
+                line: 2,
+                fields: [("thread", thread), ("koid", thread_koid), ("", 0), ("", 0)],
+                field_count: 2,
+            };
+            if reap_first {
+                c.add(1, reap)?;
+                c.add(0, syscall)?;
+            } else {
+                c.add(0, syscall)?;
+                c.add(1, reap)?;
+            }
+            assert_eq!(c.tasks.get(&thread).and_then(|t| t.process), Some(process));
+            assert_eq!(c.koids.get(&thread), Some(&thread_koid));
+            let expected_name = if named { "ls" } else { "process" };
+            assert_eq!(
+                c.processes.get(&process).map(String::as_str),
+                Some(expected_name)
+            );
+            c.sort();
+            let mut output = Vec::new();
+            export::perfetto(&c, &mut output, false)?;
+            let mut owner_pid = None;
+            let mut thread_pid = None;
+            for (_, packet) in fields(&output)? {
+                if let Ok(tree) = field(packet, 122) {
+                    for (key, entry) in fields(tree)? {
+                        if key == 1
+                            && field(entry, 3)?
+                                == format!("{expected_name}[{process:#018x}]").as_bytes()
+                        {
+                            owner_pid = Some(number(entry, 1)?);
+                        }
+                        if key == 2 && number(entry, 1)? == thread_koid {
+                            thread_pid = Some(number(entry, 2)?);
+                        }
+                    }
+                }
+            }
+            assert!(owner_pid.is_some());
+            assert_eq!(thread_pid, owner_pid);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn absent_process_observation_does_not_invent_a_parent() -> Result<(), Box<dyn std::error::Error>> {
+    use hyper_os::inspect::trace::{Category, TraceRecord};
+    for (name, count) in [("syscall_enter", 1), ("syscall_enter", 2), ("unrelated", 2)] {
+        let mut c = capture();
+        c.add(
+            0,
+            TraceRecord {
+                sequence: 0,
+                timestamp_ns: 2000,
+                category: Category::Syscall,
+                name,
+                source: "test",
+                line: 1,
+                fields: [
+                    ("thread", 42),
+                    ("process", if name == "unrelated" { 100 } else { 0 }),
+                    ("", 0),
+                    ("", 0),
+                ],
+                field_count: count,
+            },
+        )?;
+        assert!(c.tasks.is_empty());
+        assert!(c.processes.is_empty());
+    }
+    Ok(())
+}

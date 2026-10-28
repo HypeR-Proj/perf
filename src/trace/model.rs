@@ -92,6 +92,22 @@ impl Capture {
         {
             self.koids.insert(thread, koid);
         }
+        // A snapshot can outlive the thread's task-inspector entry. Syscall
+        // entry records retain its process KOID independently of live metadata.
+        // Keep inspected names/roles when available; an unobserved name stays
+        // explicitly generic rather than borrowing another process's identity.
+        if record.name == "syscall_enter"
+            && let (Some(thread), Some(process)) = (record.value("thread"), record.value("process"))
+            && process != 0
+        {
+            self.tasks.entry(thread).or_insert(Task {
+                process: Some(process),
+                idle: false,
+            });
+            self.processes
+                .entry(process)
+                .or_insert_with(|| "process".into());
+        }
         // A small site catalogue avoids allocating a search key per event.
         // Compare all metadata: source names can be truncated on the wire.
         let site = if let Some(site) = self.sites.iter().position(|site| {

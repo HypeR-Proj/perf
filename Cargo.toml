@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: 2026 roolrz
 # SPDX-License-Identifier: Apache-2.0
 
-bin = [
-    { name = "hyper-perf", path = "src/main.rs", test = false, bench = false },
-]
+bin = [{name = "hyper-perf", path = "src/main.rs", test = false, bench = false}]
 
 [package]
 name = "hyper-perf"
@@ -13,27 +11,28 @@ license = "Apache-2.0"
 repository = "https://github.com/HypeR-Proj/perf"
 publish = false
 autotests = false
+workspace = ".."
+
+[dependencies]
 
 [dependencies.clap]
-version = "=4.6.6"
-features = [
-    "derive",
-]
+workspace = true
+features = ["derive"]
 
 [dependencies.hyper-os]
-version = "=0.0.0"
+workspace = true
 
 [dependencies.hyper-rt]
-version = "=0.0.0"
-features = [
-    "std",
-]
+workspace = true
+features = ["std"]
 
 [dependencies.hyper-service]
-version = "=0.0.0"
+workspace = true
 
 [dependencies.serde_json]
-version = "1"
+workspace = true
+
+[lints]
 
 [lints.clippy]
 doc_markdown = "deny"
@@ -52,15 +51,13 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = [
-    "cfg(target_os, values(\"hyper\"))",
-]
+check-cfg = ["cfg(target_os, values(\"hyper\"))"]
+
+[target]
+
+[target."cfg(target_os = \"hyper\")"]
+
+[target."cfg(target_os = \"hyper\")".dependencies]
 
 [target."cfg(target_os = \"hyper\")".dependencies.hyper-clap-shared]
-version = "=0.0.0"
-
-[workspace]
-members = [
-    ".",
-]
-resolver = "3"
+workspace = true

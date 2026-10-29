@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+
+config SYSTEM_APP_PERF
+    bool "perf (/bin/perf)"
+    default y
+    help
+        Build and deploy hyper-perf at /bin/perf.
+

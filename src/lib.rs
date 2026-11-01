@@ -13,3 +13,6 @@ mod proto_tests;
 #[cfg(test)]
 #[path = "../tests/trace.rs"]
 mod tests;
+
+#[cfg(target_os = "hyper")]
+extern crate hyper_clap_shared as clap;

@@ -5,32 +5,27 @@ bin = [{name = "hyper-perf", path = "src/main.rs", test = false, bench = false}]
 
 [package]
 name = "hyper-perf"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/HypeR-Proj/perf"
 publish = false
 autotests = false
-workspace = ".."
 
 [dependencies]
 
-[dependencies.clap]
-workspace = true
-features = ["derive"]
-
 [dependencies.hyper-os]
-workspace = true
+version = "=0.0.0"
 
 [dependencies.hyper-rt]
-workspace = true
+version = "=0.0.0"
 features = ["std"]
 
 [dependencies.hyper-service]
-workspace = true
+path = "../../lib/service"
 
 [dependencies.serde_json]
-workspace = true
+version = "1"
 
 [lints]
 
@@ -60,4 +55,30 @@ check-cfg = ["cfg(target_os, values(\"hyper\"))"]
 [target."cfg(target_os = \"hyper\")".dependencies]
 
 [target."cfg(target_os = \"hyper\")".dependencies.hyper-clap-shared]
-workspace = true
+path = "../../lib/clap"
+default-features = false
+features = ["derive"]
+
+[target."cfg(not(target_os = \"hyper\"))"]
+
+[target."cfg(not(target_os = \"hyper\"))".dependencies]
+
+[target."cfg(not(target_os = \"hyper\"))".dependencies.clap]
+version = "=4.6.6"
+features = ["derive"]
+
+[workspace]
+resolver = "3"
+members = []
+
+[profile]
+
+[profile.release]
+codegen-units = 1
+debug = 1
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = true
+panic = "abort"
+strip = "none"

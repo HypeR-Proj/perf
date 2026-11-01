@@ -3,8 +3,6 @@
 
 //! PMU sampling and bounded static-event capture with Perfetto export.
 mod trace;
-#[cfg(target_os = "hyper")]
-extern crate hyper_clap_shared as _;
 use clap::{Parser, Subcommand};
 use hyper_os::{Error, Status, inspect::CpuInspector};
 use std::{
@@ -272,3 +270,6 @@ fn main() -> std::process::ExitCode {
         }
     }
 }
+
+#[cfg(target_os = "hyper")]
+extern crate hyper_clap_shared as clap;

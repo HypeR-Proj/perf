@@ -5,16 +5,41 @@ SPDX-License-Identifier: Apache-2.0
 
 # perf
 
-A HypeR component. See [HypeR](https://github.com/HypeR-Proj/HypeR) for
-workspace setup and the installed SDK build boundary.
+Native trace and PMU capture command.
 
-## Workspace tests
+Controls kernel profiling through delegated inspector/profiling capabilities and exports
+trace records in Perfetto-compatible form. Portable formatting lives in the library
+target; runtime capture belongs to the executable.
 
-Use the [HypeR workspace](https://github.com/HypeR-Proj/HypeR) to resolve dependencies:
+See the [implementation entry](src/lib.rs) and [component declaration](component.json)
+for the public interfaces, build dependencies and delivered artifacts.
+
+## Usage
+
+In a Native session with the required capabilities:
 
 ```sh
-python3 project.py test perf
+perf --help
 ```
 
-Paths in the documentation are relative to the repo-managed workspace root.
-Edit this repository and prepare the workspace again before building.
+## Boundaries
+
+Capture support depends on kernel configuration and hardware. Stopping a capture retains
+its buffer for dump/repeated reads; release stopped static-event buffers with `perf
+trace clear` after saving the trace.
+
+## Build and test
+
+Use this checkout inside the [repo-managed workspace](https://github.com/HypeR-Proj/HypeR).
+From this repository directory:
+
+```sh
+make
+make test
+```
+
+An absolute `OUT=/path/to/out` selects a shared output directory. The module
+entry delegates to build/system, which prepares the installed SDK and declared
+dependencies. Native binaries require HypeR; host module checks cover the tests
+selected by component.json. A standalone clone does not contain the workspace’s
+other source repositories or Native SDK.

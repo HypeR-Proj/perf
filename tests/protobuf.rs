@@ -385,6 +385,10 @@ fn interleaved_rpc_intervals_preserve_wire_endpoints() -> Result<(), Box<dyn std
         };
         let time = number(packet, 8)? + c.info.started_ns;
         let track = number(event, 11)?;
+        if track == 1 {
+            assert_eq!(field(event, 23)?, b"HypeR export complete");
+            continue;
+        }
         match number(event, 9)? {
             1 | 3 => {
                 assert_eq!(field(event, 23)?, b"RPC round trip");
@@ -539,6 +543,96 @@ fn absent_process_observation_does_not_invent_a_parent() -> Result<(), Box<dyn s
         )?;
         assert!(c.tasks.is_empty());
         assert!(c.processes.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn lossy_default_export_preserves_raw_io_without_derived_lifetimes()
+-> Result<(), Box<dyn std::error::Error>> {
+    for loss in 0..3 {
+        let mut c = native_capture();
+        match loss {
+            0 => c.losses[0].incomplete = true,
+            1 => c.losses[1].overwritten = 1,
+            _ => c.limited = true,
+        }
+        let mut output = Vec::new();
+        export::perfetto(&c, &mut output, false)?;
+        let mut names = Vec::new();
+        for (_, packet) in fields(&output)? {
+            if let Ok(event) = field(packet, 11)
+                && let Ok(name) = field(event, 23)
+            {
+                names.push(name);
+            }
+        }
+        assert!(names.contains(&b"block_submit".as_slice()));
+        assert!(names.contains(&b"block_complete".as_slice()));
+        assert!(!names.contains(&b"Block batch".as_slice()));
+        assert!(!names.contains(&b"RPC round trip".as_slice()));
+    }
+    Ok(())
+}
+
+#[test]
+fn export_receipt_follows_all_packets_and_never_masks_output_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    struct Destination {
+        packets: Vec<Vec<u8>>,
+        fail_at: usize,
+    }
+    impl std::io::Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.packets.len() == self.fail_at {
+                return Err(std::io::Error::other("injected destination failure"));
+            }
+            self.packets.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for lossy in [false, true] {
+        let mut c = native_capture();
+        c.limited = lossy;
+        let mut output = Destination {
+            packets: Vec::new(),
+            fail_at: usize::MAX,
+        };
+        export::perfetto(&c, &mut output, false)?;
+        let last = output.packets.last().ok_or("missing export receipt")?;
+        let event = field(field(last, 1)?, 11)?;
+        assert_eq!(field(event, 23)?, b"HypeR export complete");
+        let mut counts = std::collections::BTreeMap::new();
+        for (key, value) in fields(event)? {
+            if key == 4 {
+                counts.insert(field(value, 10)?, number(value, 3)?);
+            }
+        }
+        assert_eq!(
+            counts.get(b"source_events".as_slice()),
+            Some(&(c.events.len() as u64))
+        );
+        assert_eq!(
+            counts.get(b"payload_packets".as_slice()),
+            Some(&((output.packets.len() - 1) as u64))
+        );
+        for fail_at in 0..output.packets.len() {
+            let mut failed = Destination {
+                packets: Vec::new(),
+                fail_at,
+            };
+            assert!(export::perfetto(&c, &mut failed, false).is_err());
+            assert_eq!(failed.packets, output.packets[..fail_at]);
+            assert!(
+                !failed
+                    .packets
+                    .iter()
+                    .any(|p| p.windows(21).any(|s| s == b"HypeR export complete"))
+            );
+        }
     }
     Ok(())
 }

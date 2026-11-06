@@ -183,6 +183,9 @@ pub fn perfetto(c: &Capture, output: impl Write, raw_events: bool) -> io::Result
     render(c, output, raw_events, true)
 }
 fn render(c: &Capture, output: impl Write, raw_events: bool, native: bool) -> io::Result<()> {
+    // Loss disables derived lifetimes. Preserve their raw observations instead
+    // of silently discarding the only remaining I/O and RPC evidence.
+    let raw_events = raw_events || c.loss();
     let mut threads = BTreeMap::new();
     for event in &c.events {
         for key in ["thread", "prev", "next", "waker"] {

@@ -57,7 +57,7 @@ pub struct Capture {
     #[arg(long, default_value = "all", value_parser = cpus)]
     pub cpus: CpuSelection,
     /// Records allocated per selected CPU when capture starts; retained until clear.
-    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u64).range(64..=16384))]
+    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u64).range(64..))]
     pub buffer_records: u64,
 }
 #[derive(Clone, Debug)]
@@ -101,7 +101,7 @@ pub struct Export {
     /// Skip best-effort live thread-name lookups.
     #[arg(long)]
     pub no_names: bool,
-    /// Treat any overwrite or incomplete CPU stream as a command failure.
+    /// Fail on capture loss after the workload exits; never kill it for loss alone.
     #[arg(long)]
     pub fail_on_loss: bool,
     /// Allow replacement of an existing output file.

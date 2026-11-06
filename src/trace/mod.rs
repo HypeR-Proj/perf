@@ -4,7 +4,7 @@ use hyper_os::{
     Error, Status,
     inspect::{CpuInspector, ScanCursor, TaskInspector, ThreadRole},
 };
-use hyper_perf::{export, model, options};
+use hyper_perf::{export, model, options, output};
 pub use options::Command;
 use std::{
     io::{self, Write},
@@ -147,13 +147,6 @@ fn write(
     output: Box<dyn Write>,
 ) -> Result<()> {
     capture.sort();
-    let mut output = io::BufWriter::new(output);
-    match options.format {
-        options::Format::Perfetto => export::perfetto(capture, &mut output, options.raw_events)?,
-        options::Format::Chrome => export::chrome(capture, &mut output, options.raw_events)?,
-        options::Format::Jsonl => export::jsonl(capture, &mut output)?,
-    }
-    output.flush()?;
     let lost: u64 = capture.losses.iter().map(|loss| loss.overwritten).sum();
     eprintln!(
         "perf trace: {} events; {lost} overwritten; incomplete CPUs={}; event limit reached={}",
@@ -161,6 +154,28 @@ fn write(
         capture.losses.iter().filter(|loss| loss.incomplete).count(),
         capture.limited
     );
+    eprintln!("perf trace: exporting to {}", options.output);
+    let started = std::time::Instant::now();
+    let bytes = output::buffered(
+        output,
+        |output| match options.format {
+            options::Format::Perfetto => export::perfetto(capture, output, options.raw_events),
+            options::Format::Chrome => export::chrome(capture, output, options.raw_events),
+            options::Format::Jsonl => export::jsonl(capture, output),
+        },
+        |bytes| eprintln!("perf trace: exported {} MiB", bytes / (1024 * 1024)),
+    )?;
+    eprintln!(
+        "perf trace: wrote {bytes} bytes in {} ms",
+        started.elapsed().as_millis()
+    );
+    eprintln!("perf trace: export complete");
+    Ok(())
+}
+
+// Quality failure is reported after joining the workload, not as an export
+// failure: a diagnostic capture must not truncate the operation it measures.
+fn check_quality(capture: &model::Capture, options: &options::Export) -> Result<()> {
     if options.fail_on_loss && capture.loss() {
         return Err("trace contains loss; output retained for diagnosis".into());
     }
@@ -240,6 +255,7 @@ pub fn run(
                 machines.refresh(&mut capture);
             }
             write(&mut capture, &export, output)?;
+            check_quality(&capture, &export)?;
         }
         Command::Record {
             capture: config,
@@ -325,18 +341,16 @@ pub fn run(
             }
             let mut capture = result?;
             stopped?;
+            eprintln!("perf trace: capture stopped; finishing metadata and workload");
             if !export.no_names {
                 machines.finish(&mut capture);
             }
-            if let Err(error) = write(&mut capture, &export, output) {
-                if let Some(child) = child.as_mut() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                return Err(error);
-            }
-            // The time limit bounds capture, not the workload's execution.
+            // Capture deadlines bound observation, not the workload. Defer
+            // export I/O until the workload finishes so a disk destination
+            // neither competes with it nor aborts it on an output failure.
             let status = child.as_mut().map(|child| child.wait()).transpose()?;
+            write(&mut capture, &export, output)
+                .map_err(|error| format!("trace export to {} failed: {error}", export.output))?;
             if let Some(status) = status
                 && !status.success()
             {
@@ -347,6 +361,7 @@ pub fn run(
                         .unwrap_or(1),
                 ));
             }
+            check_quality(&capture, &export)?;
         }
     }
     Ok(std::process::ExitCode::SUCCESS)

@@ -7,6 +7,11 @@ pub mod export;
 pub mod model;
 #[path = "trace/options.rs"]
 pub mod options;
+#[path = "trace/output.rs"]
+pub mod output;
+#[cfg(test)]
+#[path = "../tests/output.rs"]
+mod output_tests;
 #[cfg(test)]
 #[path = "../tests/protobuf.rs"]
 mod proto_tests;

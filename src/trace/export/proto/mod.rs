@@ -32,6 +32,7 @@ pub(super) struct Output {
     counters: std::collections::BTreeSet<u64>,
     slice_lanes: BTreeMap<(u32, u32), Vec<(u64, u64)>>,
     next_lane: u64,
+    source_events: usize,
 }
 
 impl Output {
@@ -68,9 +69,12 @@ impl Output {
             counters: Default::default(),
             slice_lanes: Default::default(),
             next_lane: 1 << 62,
+            source_events: c.events.len(),
         };
         let mut root = descriptor(1, "HypeR", None);
         let mut identity = metadata(c);
+        identity["export_completion"] = serde_json::json!("hyper-export-v1");
+        identity["collected_events"] = serde_json::json!(c.events.len());
         identity["exported_threads"] = serde_json::json!(
             threads
                 .iter()
@@ -304,6 +308,8 @@ impl Output {
         // Endpoints are discovered at completion. Sort before serializing so
         // nested RPCs and migrated threads obey TrackEvent's ordering contract.
         self.packets.sort_by_key(|p| (p.time, p.order, p.tie));
+        let packet_count = self.packets.len();
+        let end = self.packets.last().map_or(0, |packet| packet.time);
         for (i, mut packet) in self.packets.into_iter().enumerate() {
             if i == 0 {
                 packet.data.number(13, 1);
@@ -312,6 +318,24 @@ impl Output {
             wrapper.message(1, packet.data);
             output.write_all(&wrapper.0)?;
         }
+        // A packet-aligned prefix is valid protobuf too. Emit this receipt only
+        // after every payload packet, independently of source capture loss.
+        // It proves serialization completion, not flush or device durability.
+        let mut receipt = Message::default();
+        receipt.number(9, 3); // TYPE_INSTANT on the existing HypeR root track.
+        receipt.number(11, 1);
+        receipt.text(23, "HypeR export complete");
+        annotations(
+            &mut receipt,
+            &serde_json::json!({"payload_packets": packet_count, "source_events": self.source_events}),
+        );
+        let mut packet = Message::default();
+        packet.number(8, end);
+        packet.number(10, 1);
+        packet.message(11, receipt);
+        let mut wrapper = Message::default();
+        wrapper.message(1, packet);
+        output.write_all(&wrapper.0)?;
         Ok(())
     }
 }

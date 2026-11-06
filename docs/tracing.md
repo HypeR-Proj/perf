@@ -14,8 +14,9 @@ The default view has CPU scheduling tracks and process-grouped Threads, with
 Running, Runnable and Sleeping states. Thread activity tracks contain IPC/RPC
 flows, syscall intervals and switch-out reasons. `perf` translates existing
 observations in userspace; no additional kernel event is needed. Add
-`--raw-events` to include raw instant observations. `--format chrome` retains
-Chrome Trace JSON for diagnostics; `--format jsonl` retains raw records.
+`--raw-events` to include raw instant observations. Lossy exports include them
+automatically so suppressed derived spans do not discard the underlying evidence.
+`--format chrome` retains Chrome Trace JSON for diagnostics; `--format jsonl` retains raw records.
 
 ## Build and capture
 
@@ -77,7 +78,7 @@ command because child output would corrupt that stream.
 | `--duration-ms` | 10000 | Kernel-enforced duration, 1–300000 ms |
 | `--categories` | `scheduler,vm,ipc,io` | Comma-separated categories below, or `all` |
 | `--cpus` | `all` | Online indices/ranges, e.g. `0,2-3`; offline CPUs fail |
-| `--buffer-records` | 16384 | Records allocated per selected CPU at start, 64–16384 |
+| `--buffer-records` | 16384 | Records allocated per selected CPU at start, 64–`trace status` maximum (currently 65536) |
 | `--poll-ms` | 10 | `record` polling interval, 1–1000 ms; snapshot mode polls child/deadline state only |
 | `--snapshot` | off | `record` reads only after stopping; suitable for short workloads that fit the per-CPU rings |
 | `--max-events` | 262144 | Userspace event bound, 1–4000000 |
@@ -339,12 +340,54 @@ CI uploads the raw files even when host-side content validation fails. A failed
 guest command retains its serial command report and the disposable disk under
 `target/board-tests/trace.*/` for local diagnosis.
 
+## Capture quality and workload completion
+
+`--fail-on-loss` reports a nonzero result after a successfully exported capture
+and its workload have both finished. Loss alone never terminates the workload.
+Export starts only after the workload has exited, so a disk destination does not
+compete with the measured workload. An output error cannot terminate that workload.
+A nonzero workload exit code takes precedence over the capture-quality failure;
+the capture summary still reports loss. Collection and stop errors remain fatal
+and terminate/join an owned child. `record` output errors report the destination
+path and retain any partial output.
+The capture summary is printed before export; `perf trace: export complete`
+appears only after the output has flushed successfully. This is not a device
+durability fence; unmount or sync the destination separately.
+
+Exports coalesce small encoded packets in a bounded 128 KiB userspace buffer.
+This amortizes filesystem requests on synchronous destinations such as FAT;
+it does not enable filesystem writeback or weaken synchronization. Diagnostics
+identify the end of capture, export destination, each 4 MiB of accepted output,
+and total export bytes/time. Progress reports accepted writes, not durability.
+Returned serialization or write errors discard pending buffered bytes without
+retrying them during destructor cleanup.
+
+Native protobuf includes a final `HypeR export complete` instant on the root
+track, with payload-packet and collected-event counts. Capture metadata declares
+this receipt contract. The artifact validator rejects a missing receipt, a
+non-final receipt or mismatched counts, even when a truncated prefix is valid
+protobuf. Older files without the contract have unknown export completeness.
+The receipt is also present for completely exported lossy captures; source loss
+and export completion are independent. It is not a checksum or a device fence.
+
+For large exports, a disk-backed `--output` avoids storing a second large RAMFS
+copy. `/tmp` now uses independently allocated payload pages and supports large
+exports without file-sized contiguous allocations, but still consumes RAM and
+its retained resource quota.
+
+Live readers share the nonblocking producer's ring lock and can themselves cause
+`incomplete` observations. Use `--snapshot` for bounded hardware experiments:
+it reads rings only after stopping. Size the per-CPU buffers for the whole
+interval; larger buffers do not fix live-reader contention, and snapshot mode
+can still overflow or encounter other producer losses. Keep loss checks enabled.
+
 ## Bounds and loss
 
 Payload storage is allocated at `start`, only for selected CPUs and the requested
 record count. The default is 16384 × 56 bytes (896 KiB) per selected CPU, or 3.5 MiB
 for four CPUs, plus small control headers. No payload buffers exist before the
-first capture or after `clear`. `stop` retains them for repeatable export.
+first capture or after `clear`. The maximum is 65536 records per selected CPU
+(3.5 MiB each, 14 MiB for four CPUs); the default remains 16384. `stop` retains them for repeatable export.
 Replacement prepares new buffers before releasing the old capture, so allocation
 failure preserves the old data and temporary usage includes both captures.
 Without `kernel-trace`, storage and instrumentation compile out. Runtime-disabled points only
@@ -363,7 +406,7 @@ event count are independent bounds.
 
 Overwrites are counted per CPU. Contention/recursion/clock failure is a sticky
 `incomplete` flag, not an exact dropped-event count. Loss is retained in capture
-metadata; `--raw-events` also includes `TRACE LOSS`/`TRACE GAP` markers. Missing events invalidate pending spans;
+metadata; lossy exports automatically retain raw events and `TRACE LOSS`/`TRACE GAP` markers. Missing events invalidate pending spans;
 capture loss suppresses repeatable RPC annotations and elapsed syscall/wait
 intervals, since missing boundaries can hide another invocation. Committed IPC
 message sequences and device tags are non-reused within their unique queue/domain:
@@ -385,3 +428,6 @@ more frequently to reduce overwrite; collecting itself also has overhead.
 Native scheduling uses the OS-independent `sched`/`thread_state` tables;
 activities and arrows use `slice`/`args`/`flow`. HypeR does not emit synthetic Linux
 ftrace records. No live Perfetto daemon or tracing service is installed.
+
+`make test-trace-volume` exercises direct-to-FAT and RAMFS exports beyond 32 MiB
+from the same bounded IPC capture, including their completion receipts.

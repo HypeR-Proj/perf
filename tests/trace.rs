@@ -430,7 +430,7 @@ fn loss_keeps_block_boundaries_raw_without_inventing_command_slots()
         &[("domain", 1), ("tag", 42), ("read", 1)],
     );
     c.losses[1].incomplete = true;
-    let v = json(&mut c)?;
+    let v = render(&mut c, false)?;
     assert!(spans(&v).iter().all(|e| e["pid"] != 4));
     for name in ["block_submit", "block_complete"] {
         assert!(
@@ -829,14 +829,11 @@ fn incomplete_data_keeps_names_and_capture_metadata() -> Result<(), Box<dyn std:
             .any(|run| run["pid"] == 1 && run["name"] == "io-runtime")
     );
     assert!(
-        !value["traceEvents"]
+        value["traceEvents"]
             .as_array()
             .ok_or("missing events")?
             .iter()
-            .any(|e| matches!(
-                e["name"].as_str(),
-                Some("Incomplete trace data" | "TRACE LOSS" | "TRACE GAP")
-            ))
+            .any(|e| matches!(e["name"].as_str(), Some("TRACE LOSS")))
     );
     Ok(())
 }
@@ -987,7 +984,11 @@ fn record_cli_covers_limits_output_and_workload() -> Result<(), Box<dyn std::err
             _ => return Err("wrong command".into()),
         }
     }
-    assert!(Args::try_parse_from(["trace", "start", "--buffer-records", "16385"]).is_err());
+    // The running kernel advertises/enforces the upper allocation bound.
+    match Args::try_parse_from(["trace", "start", "--buffer-records", "65536"])?.command {
+        options::Command::Start(capture) => assert_eq!(capture.config().capacity, 65536),
+        _ => return Err("wrong command".into()),
+    }
     Ok(())
 }
 

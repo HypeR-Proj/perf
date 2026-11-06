@@ -33,7 +33,7 @@ impl<W: Write, P: FnMut(u64)> Write for Destination<W, P> {
 
 /// Coalesce small encoded packets without changing the exported bytes. Progress
 /// counts accepted writes, not durable media. On failure discard buffered data:
-/// BufWriter's destructor must not retry I/O after reporting an export error.
+/// `BufWriter`'s destructor must not retry I/O after reporting an export error.
 pub fn buffered(
     writer: impl Write,
     serialize: impl FnOnce(&mut dyn Write) -> io::Result<()>,
